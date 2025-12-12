@@ -1,22 +1,25 @@
-import uuid
-import logging
 import json
+import logging
+import uuid
+from typing import Any
+
 import bittensor as bt
+from bittensor.utils.balance import Balance
+from celium_collateral_contracts.address_conversion import h160_to_ss58
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from eth_utils import to_hex, keccak
-from typing import Optional, Any
+from eth_utils import keccak, to_hex
+
 from core.config import settings
+from core.const import REQUIRED_DEPOSIT_AMOUNT
 from core.db import get_db
+from core.utils import _m, get_collateral_contract
 from daos.executor import ExecutorDao
+from models.executor import Executor
+from protocol.miner_portal_request import AddExecutorFailed
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
-from models.executor import Executor
-from core.utils import get_collateral_contract, _m
-from core.const import REQUIRED_DEPOSIT_AMOUNT
-from celium_collateral_contracts.address_conversion import h160_to_ss58
-from bittensor.utils.balance import Balance
-from protocol.miner_portal_request import AddExecutorFailed
+from utils.validation import ValidationError, normalize_ip_address
 
 logging.basicConfig(level=logging.INFO)
 
@@ -31,7 +34,7 @@ def require_executor_dao(func):
 
 
 class CliService:
-    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, version: str = "1.0.2"):
+    def __init__(self, private_key: str | None = None, with_executor_db: bool = False, version: str = "1.0.2"):
         """
         Initialize the CLI service.
         :param private_key: Ethereum private key for signing (optional).
@@ -275,6 +278,13 @@ class CliService:
         :param gpu_count: Number of GPUs (optional)
         :return: True if successful, False otherwise
         """
+        # Normalize IP address to prevent whitespace issues
+        try:
+            normalized_address = normalize_ip_address(address)
+        except ValidationError as e:
+            self.logger.error(f"Invalid IP address: {e}")
+            return False
+
         if validator is None:
             validator = settings.DEFAULT_VALIDATOR_HOTKEY
 
@@ -282,7 +292,7 @@ class CliService:
         result = await self.executor_service.create(
             Executor(
                 uuid=executor_uuid,
-                address=address,
+                address=normalized_address,
                 port=port,
                 validator=validator,
                 price_per_gpu=price_per_gpu
@@ -610,7 +620,7 @@ class CliService:
             self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_gpu} USD/hour")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to update executor price: %s", str(e))
+            self.logger.error("Failed to update executor price: %s", str(e))
             return False
 
     def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:

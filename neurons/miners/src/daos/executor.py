@@ -1,6 +1,7 @@
-from typing import Optional
+
 from daos.base import BaseDao
 from models.executor import Executor
+from utils.validation import normalize_ip_address
 
 
 class ExecutorDao(BaseDao):
@@ -11,10 +12,25 @@ class ExecutorDao(BaseDao):
         return executor
 
     def findOne(self, address: str, port: int) -> Executor:
+        """Find executor by address and port.
+        
+        Args:
+            address: Executor IP address (will be normalized)
+            port: Executor port
+            
+        Returns:
+            Executor object
+            
+        Raises:
+            Exception: If executor not found
+        """
+        # Normalize IP address to handle whitespace
+        normalized_address = normalize_ip_address(address)
+        
         executor = self.session.query(Executor).filter_by(
-            address=address, port=port).first()
+            address=normalized_address, port=port).first()
         if not executor:
-            raise Exception('Not found executor')
+            raise Exception(f'Not found executor at {normalized_address}:{port}')
 
         return executor
 
@@ -38,12 +54,13 @@ class ExecutorDao(BaseDao):
         return existing_executor
 
     def delete_by_address_port(self, address: str, port: int) -> None:
-        executor = self.findOne(address, port)
+        """Delete executor by address and port."""
+        executor = self.findOne(address, port)  # findOne handles normalization
 
         self.session.delete(executor)
         self.session.commit()
 
-    def get_executors_for_validator(self, validator_key: str, executor_id: Optional[str] = None) -> list[Executor]:
+    def get_executors_for_validator(self, validator_key: str, executor_id: str | None = None) -> list[Executor]:
         """Get executors that opened to valdiator
 
         Args:
