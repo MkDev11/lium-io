@@ -1,52 +1,50 @@
 import asyncio
-import random
-from datetime import datetime
 import logging
-import time
-from typing import Annotated, Any
-from uuid import uuid4, UUID
-import shlex
+import random
 import secrets
+import shlex
+import time
+from datetime import datetime
+from typing import Annotated
+from uuid import UUID, uuid4
+
 import aiohttp
 import asyncssh
 import bittensor
 import redis.exceptions
+from daos.port_mapping_dao import PortMappingDao
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
+    AddSshPublicKeyRequest,
+    ContainerCreated,
     ContainerCreateRequest,
+    ContainerDeleted,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
-    AddSshPublicKeyRequest,
+    ContainerWarningCode,
+    CustomOptions,
+    ExternalVolumeInfo,
+    FailedContainerErrorCodes,
+    FailedContainerErrorTypes,
+    FailedContainerRequest,
+    InstallJupyterServerRequest,
+    JupyterInstallationFailed,
+    JupyterServerInstalled,
     RemoveSshPublicKeysRequest,
-    ContainerCreated,
-    ContainerDeleted,
-    ContainerStarted,
-    ContainerStopped,
     SshPubKeyAdded,
     SshPubKeyRemoved,
-    FailedContainerErrorCodes,
-    FailedContainerRequest,
-    FailedContainerErrorTypes,
-    ExternalVolumeInfo,
-    InstallJupyterServerRequest,
-    JupyterServerInstalled,
-    JupyterInstallationFailed,
-    CustomOptions,
-    ContainerWarningCode,
 )
-from protocol.vc_protocol.compute_requests import RentedMachine
-
-from core.utils import _m, get_extra_info, retry_ssh_command
-from daos.port_mapping_dao import PortMappingDao
-from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
+from services.const import MIN_PORT_COUNT, PREFERRED_POD_PORTS
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
+from services.ssh_connection_pool import get_ssh_pool
+
+from core.utils import _m, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
-from models.port_mapping import PortMapping
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +73,7 @@ class DockerService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.port_mapping_dao = port_mapping_dao
+        self.ssh_pool = get_ssh_pool()
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
@@ -201,7 +200,7 @@ class DockerService:
                     status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
                 else:
                     status, error = await self._stream_process_output(process, log_tag)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             status = False
             error = "Process timed out"
             await self.stream_log(error, "error", log_tag)
@@ -309,7 +308,7 @@ class DockerService:
         sleep: int = 0,
         clear_volume: bool = True
     ):
-        command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
+        command = '/usr/bin/docker ps -a --format "{{.Names}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # wait until the docker connection check is finished.
@@ -333,7 +332,7 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                command = f'/usr/bin/docker volume prune -af'
+                command = '/usr/bin/docker volume prune -af'
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
     async def install_open_ssh_server_and_start_ssh_service(
@@ -420,7 +419,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
     ):
         # disable volume plugin
-        command = f"/usr/bin/docker plugin disable s3fs -f"
+        command = "/usr/bin/docker plugin disable s3fs -f"
         await ssh_client.run(command)
 
     async def run_jupyter(
@@ -525,7 +524,7 @@ class DockerService:
     
     async def get_docker_root_dir(self, ssh_client: asyncssh.SSHClientConnection):
         """Get Docker storage info using docker info command"""
-        command = f"/usr/bin/docker info --format '{{{{.DockerRootDir}}}}'"
+        command = "/usr/bin/docker info --format '{{.DockerRootDir}}'"
         result = await ssh_client.run(command)
         return result.stdout.strip()
     
@@ -681,14 +680,12 @@ class DockerService:
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-            pkey = asyncssh.import_private_key(private_key)
 
-            async with asyncssh.connect(
+            async with self.ssh_pool.get_connection(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
+                private_key=private_key,
             ) as ssh_client:
                 # Add profiler for ssh connection
                 profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -878,7 +875,7 @@ class DockerService:
                     log_extra=default_extra,
                     timeout=timeout
                 )
-                logger.info(f"Container creation step finished")
+                logger.info("Container creation step finished")
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
@@ -1035,14 +1032,12 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
-        async with asyncssh.connect(
+        async with self.ssh_pool.get_connection(
             host=executor_info.address,
             port=executor_info.ssh_port,
             username=executor_info.ssh_username,
-            client_keys=[pkey],
-            known_hosts=None,
+            private_key=private_key,
         ) as ssh_client:
             await ssh_client.run(f"/usr/bin/docker stop {payload.container_name}")
 
@@ -1079,14 +1074,12 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
-        async with asyncssh.connect(
+        async with self.ssh_pool.get_connection(
             host=executor_info.address,
             port=executor_info.ssh_port,
             username=executor_info.ssh_username,
-            client_keys=[pkey],
-            known_hosts=None,
+            private_key=private_key,
         ) as ssh_client:
             await ssh_client.run(f"/usr/bin/docker start {payload.container_name}")
             logger.info(
@@ -1123,21 +1116,19 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
         try:
-            async with asyncssh.connect(
+            async with self.ssh_pool.get_connection(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
+                private_key=private_key,
             ) as ssh_client:
                 # await ssh_client.run(f"docker stop {payload.container_name}")
                 command = f"/usr/bin/docker rm {payload.container_name} -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                command = f"/usr/bin/docker image prune -f"
+                command = "/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
                 if payload.local_volume:
@@ -1221,15 +1212,13 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
         try:
-            async with asyncssh.connect(
+            async with self.ssh_pool.get_connection(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
+                private_key=private_key,
             ) as ssh_client:
                 jupyter_token = secrets.token_hex(16)
                 jupyter_port = payload.jupyter_port_map[0]
@@ -1303,15 +1292,13 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
         try:
-            async with asyncssh.connect(
+            async with self.ssh_pool.get_connection(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
+                private_key=private_key,
             ) as ssh_client:
                 if not payload.user_public_keys:
                     log_text = _m(
@@ -1408,15 +1395,13 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
         try:
-            async with asyncssh.connect(
+            async with self.ssh_pool.get_connection(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
+                private_key=private_key,
             ) as ssh_client:
                 if not payload.user_public_keys:
                     log_text = _m(
